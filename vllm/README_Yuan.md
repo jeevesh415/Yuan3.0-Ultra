@@ -1,10 +1,10 @@
 ##  1. Docker image
 
 
-We recommend using the latest release of docker images of Yuan3.0 Ultra. You can launch an instance of the Yuan 3.0 Ultra container with the following Docker commands:
+We strongly recommend using the latest release of docker images of Yuan3.0 Ultra. You can launch an instance of the Yuan 3.0 Ultra container with the following Docker commands:
 
 ```bash
-docker pull yuanlabai/vllm:v0.11.0
+docker pull yuanlabai/vllm:v0.17.0
 ```
 
 
@@ -26,16 +26,20 @@ pip install -e .
 You can launch an instance of the Yuan 3.0 Ultra container with the following Docker commands:
 
 ```bash
-docker run --gpus all -itd --network=host --privileged --cap-add=IPC_LOCK --ulimit stack=68719476736 --shm-size=1000G -v /path/to/dataset:/workspace/dataset -v /path/to/checkpoints:/workspace/checkpoints --name your_name yuanlabai/vllm:v0.11.0
+docker run --gpus all -itd --network=host --privileged --cap-add=IPC_LOCK --ulimit stack=68719476736 --shm-size=1000G -v /path/to/dataset:/workspace/dataset -v /path/to/checkpoints:/workspace/checkpoints --name your_name yuanlabai/vllm:v0.17.0
 docker exec -it your_name bash
 ```
 
 **3.2  Deployment service**
 
-Yuan3.0 Ultra Model just support vLLm V1. Please refer to the tutorial [multi-node-serving](./examples/online_serving/multi-node-serving.sh) for starting the ray service.
+Yuan3.0 Ultra Model just support vLLm V1. <br>
+Please refer to the tutorial [multi-node-serving](./examples/online_serving/multi-node-serving.sh) for starting the ray service. <br>
+There are [bugs](https://github.com/vllm-project/vllm/issues/35848) in multi-node deployments using ray as the backend. <br>
+Please use RAY_V2 as the backend. Set 'export VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1' <br>
 ```bash
 python -m vllm.entrypoints.openai.api_server --model=/path/Yuan3.0-Ultra-int4 --port 8100 --gpu-memory-utilization 0.9 \
- --tensor-parallel-size 4 --pipeline-parallel-size 4 --trust-remote-code --allowed-local-media-path "/path/images"
+ --tensor-parallel-size 4 --pipeline-parallel-size 4 --distributed-executor-backend ray \
+ --trust-remote-code --allowed-local-media-path "/path/images"
 ```
 > **Note 1**: You might also need to setup [network setup](./docs/usage/troubleshooting.md#L76).   
 > **Note 2**: For the int4 model, the parallel configuration of tensor-parallel-size=4 and pipeline-parallel-size=4 is suggested.   

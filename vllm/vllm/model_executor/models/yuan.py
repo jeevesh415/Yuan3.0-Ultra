@@ -1,22 +1,17 @@
 """Inference-only Yuan model compatible with HuggingFace weights."""
-import json
 import os
 import re
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple, Union
 import math
 import numpy as np
 import torch
-from torch import einsum, nn, Tensor
+from torch import nn, Tensor
 
 import vllm.envs as envs
-from vllm.model_executor.models.configuration_yuan import YuanConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.config import LoRAConfig, CacheConfig, VllmConfig, DeviceConfig, ModelConfig, ParallelConfig
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.config import CacheConfig, VllmConfig, CUDAGraphMode
 from transformers.activations import ACT2FN
-from vllm.model_executor.utils import set_weight_attrs
-from vllm.attention import Attention, AttentionMetadata
-# from vllm.model_executor.layers.fused_moe import *
+from vllm.model_executor.layers.attention.encoder_only_attention import Attention
 from vllm.model_executor.layers.linear import  (ColumnParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
@@ -30,9 +25,7 @@ from vllm.distributed import (get_ep_group, get_pp_group,
                               tensor_model_parallel_all_reduce,
                               tensor_model_parallel_all_gather)
 from vllm.distributed.utils import get_pp_indices
-from vllm.model_executor.utils import set_weight_attrs
 from .interfaces import SupportsPP, MixtureOfExperts
-
 from .utils import (AutoWeightsLoader, PPMissingLayer,
                     is_pp_missing_parameter, make_layers,
                     maybe_prefix)
@@ -40,49 +33,16 @@ from .utils import (AutoWeightsLoader, PPMissingLayer,
 from vllm.model_executor.layers.layernorm import RMSNorm as VLLM_RMSNorm
 from vllm.model_executor.layers.fused_moe import fused_topk_v2, FusedMoE
 from vllm.model_executor.models.utils import sequence_parallel_chunk
-from vllm.attention import get_attn_backend
-from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, LayerBlockType, direct_register_custom_op,
-                        get_dtype_size, is_pin_memory_available)
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import get_current_vllm_config
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
-if envs.VLLM_ATTENTION_BACKEND == "FLASHINFER":
+try:
     from vllm.v1.attention.backends.flashinfer import FlashInferMetadata
-
-def print_ops_fake(tensor: torch.Tensor, tensor_name: str = None) -> None:
+except:
     pass
-
-def print_ops(tensor: torch.Tensor, tensor_name: str = None) -> None:
-    print(tensor_name, "shape: ", tensor.shape, "stride: ", tensor.stride(), "sum: ", tensor.sum(), flush=True)
-
-direct_register_custom_op(
-    op_name="print_ops",
-    op_func=print_ops,
-    mutates_args=[],
-    fake_impl=print_ops_fake,
-    tags=(torch.Tag.needs_fixed_stride_order, ),
-)
-
-
-class YuanRMSNorm(torch.nn.Module):
-
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-
-        # convert into half-precision if necessary
-        if self.weight.dtype in [torch.float16, torch.bfloat16]:
-            hidden_states = hidden_states.to(self.weight.dtype)
-
-        return self.weight * hidden_states
 
 
 class ParallelAttention_router(nn.Module):
@@ -115,24 +75,17 @@ class YuanMoeLayer(nn.Module):
                  num_experts: int,
                  prefix: str = ""):
         super().__init__()
+        self.tp_size = get_tensor_model_parallel_world_size()
         config = vllm_config.model_config.hf_text_config
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
         self.num_experts = num_experts
         self.top_k = config.moe_config['moe_top_k']
-        self.is_old_version = int(os.environ.get('OLD_YUAN_VERSION', 0))
-        self.tp_size = get_tensor_model_parallel_world_size()
 
         if config.moe_config['router_type'] == 'attn_router':
-            if self.is_old_version:
-                self.gate = ParallelAttention_router(config, self.num_experts)
-            else:
-                self.router = ParallelAttention_router(config, self.num_experts)
+            self.router = ParallelAttention_router(config, self.num_experts)
         else:
-            if self.is_old_version:
-                self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
-            else:
-                self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+            self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
 
         self.ep_group = get_ep_group().device_group
         self.ep_rank = self.ep_group.rank()
@@ -161,7 +114,7 @@ class YuanMoeLayer(nn.Module):
                                 top_k=self.top_k,
                                 hidden_size=config.hidden_size,
                                 intermediate_size=config.moe_config['ffn_hidden_size'],
-                                reduce_results=True,
+                                reduce_results=False,
                                 renormalize=config.moe_config["norm_topk_prob"],
                                 quant_config=quant_config,
                                 prefix=f"{prefix}.experts",
@@ -171,22 +124,23 @@ class YuanMoeLayer(nn.Module):
                                 custom_routing_function=fused_topk_v2)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        is_input_1d = hidden_states.dim() == 1
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        if self.is_old_version:
-            logits = self.gate(hidden_states)
-        else:
-            logits = self.router(hidden_states)
+        logits = self.router(hidden_states)
         final_hidden_states = self.experts(hidden_states, logits)
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0)
             final_hidden_states = final_hidden_states[:num_tokens]
+        elif self.tp_size > 1:
+            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
+                final_hidden_states
+            )
+
         return final_hidden_states
 
 
@@ -290,9 +244,12 @@ class YuanRotaryEmbedding(nn.Module):
         Returns:
             Tensor: Embeddings after applying RoPE.
         """
-        inv_freq = (1.0 / ( self.base**(torch.arange(0, self.dim, 2, dtype=torch.float32, device=torch.cuda.current_device()) / self.dim))).to(torch.float32)
+        inv_freq = (1.0 / ( self.base**(
+                            torch.arange(0, self.dim, 2, dtype=torch.float32,
+                            device=torch.cuda.current_device()) / self.dim)
+                        )
+                    ).to(torch.float32)
         
-        #max_seq_len_int = max_seq_len.item() if max_seq_len.numel() == 1 else max_seq_len.max().item()
         seq = (
             torch.arange(max_seq_len, device=inv_freq.device, dtype=inv_freq.dtype)
             + offset
@@ -344,7 +301,6 @@ def apply_rotary_pos_emb_bshd(t: Tensor, freqs: Tensor, position_ids: Tensor ,ro
     Returns:
         Tensor: The input tensor after applying RoPE
     """
-    dtype = t.dtype
     rot_dim = freqs.shape[-1]
     #if position_ids.shape[1] > 1:
     freqs = freqs[position_ids]
@@ -360,30 +316,6 @@ def apply_rotary_pos_emb_bshd(t: Tensor, freqs: Tensor, position_ids: Tensor ,ro
 
     t = (t * cos_) + (_rotate_half_bshd(t, rotary_interleaved) * sin_)
     return torch.cat((t, t_pass), dim=-1)
-
-def apply_rotary_pos_emb_thd(
-        t: Tensor, cu_seqlens: Tensor, freqs: Tensor, position_ids: Tensor, rotary_interleaved: bool = False,
-):
-
-    """A baseline implementation of applying RoPE for `thd` format.
-
-    Args:
-        t (Tensor): Input tensor T is of shape [t, h, d]
-        cu_seqlens(Tensor):  Cumulative sum of sequence lengths in a batch for `t`,
-        with shape [b + 1] and dtype torch.int32.
-        freqs (Tensor): Rotary Positional embedding tensor freq is of shape [max_s, 1, 1, d]
-
-    Returns:
-        Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
-    """
-
-    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-    return torch.cat(
-        [
-            apply_rotary_pos_emb_bshd(x.unsqueeze(1), freqs[: x.size(0)], position_ids)
-            for x in torch.split(t, seqlens)
-        ]
-    ).squeeze(1)
 
 
 def apply_rotary_pos_emb(t: Tensor, freqs: Tensor, position_ids: Tensor, apply_rope_fusion: bool = True, cu_seqlens: Optional[Tensor] = None):
@@ -423,17 +355,14 @@ class LocalizedFiltering(torch.nn.Module):
             self.conv2_bias = nn.Parameter(torch.empty(self.embed_dim, dtype=params_dtype).cuda())
             self.register_parameter("conv1_bias", self.conv1_bias)
             self.register_parameter("conv2_bias", self.conv2_bias)
-        '''
-        通过torch.compile + cudaGraph 支持静态图功能，要求模型的输入在profill阶段就构建好所有的输入Tensor,后续执行Tensor首地址不能发生改变
-        torch.compile 通过装饰器的方式，修饰YuanModel，torch.compile会捕获模型的动态性
-        '''
+
         self.start_layer, self.end_layer = get_pp_indices(
             config.num_hidden_layers,
             get_pp_group().rank_in_group,
             get_pp_group().world_size
         )
-        #  设置每个GPU分配2Gib的显存大小, lf_cache_nums > kv_cache_nums即可
-        if cache_config.cache_dtype == "fp8":
+
+        if cache_config.cache_dtype == "fp8" or cache_config.cache_dtype == "int8":
             scale = 2
         else:
             scale = 1
@@ -458,8 +387,8 @@ class LocalizedFiltering(torch.nn.Module):
         lf_cache = lf_caches[pre_lf_indexs]
         new_shape = [inputs.shape[0] + bs, inputs.shape[1]]
         inputs_t = torch.zeros(new_shape, dtype=inputs.dtype, device=inputs.device)
-        inputs_t[input_lf_loc] = lf_cache
         inputs_t[inputs_loc] = inputs
+        inputs_t[input_lf_loc] = lf_cache
         lf_caches.index_put_([out_lf_indexs], inputs_t[out_lf_loc])
         combined_out = torch.matmul(inputs_t, conv_weight)
         output_t = combined_out[:-1, :combined_out.shape[1]//2] + combined_out[1:, combined_out.shape[1]//2:]
@@ -548,7 +477,6 @@ class YuanAttention(nn.Module):
         self.total_num_heads = config.num_attention_heads
         self.total_num_kv_heads = getattr(config, 'num_kv_heads', self.total_num_heads)
         tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
 
         attention_projection_size = getattr(config, 'attention_projection_size', config.hidden_size)
         self.attn_head_size = attention_projection_size // self.total_num_heads
@@ -556,7 +484,8 @@ class YuanAttention(nn.Module):
         self.num_heads = (self.total_num_heads + tp_size - 1) // tp_size  
         self.num_kv_heads = max(1, (self.total_num_kv_heads + tp_size - 1) // tp_size)
 
-        self.head_dim = config.attention_projection_size // self.total_num_heads if hasattr(config, 'attention_projection_size') else hidden_size // self.total_num_heads
+        self.head_dim = config.attention_projection_size // self.total_num_heads \
+            if hasattr(config, 'attention_projection_size') else hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -645,9 +574,11 @@ class YuanDecoderLayer(nn.Module):
             if 'per_layer_experts_blocks' in config.moe_config:
                 assert config.moe_config['per_layer_experts_blocks'] != None
                 num_experts = config.moe_config['per_layer_experts_blocks'][layer_idx]
+                self.max_experts = max(config.moe_config['per_layer_experts_blocks'])
             elif 'moe_num_experts' in config.moe_config:
                 assert config.moe_config['moe_num_experts'] != None
                 num_experts = config.moe_config['moe_num_experts']
+                self.max_experts = num_experts
             else:
                 raise ValueError(f'per_layer_experts_blocks or moe_num_experts must in config.moe_config')
             self.mlp = YuanMoeLayer(vllm_config=vllm_config, num_experts=num_experts, prefix=prefix)
@@ -782,7 +713,7 @@ class YuanModel(nn.Module):
         else:
             raise ValueError(f'per_layer_experts_blocks or moe_num_experts must in config.moe_config')
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def forward(
@@ -802,11 +733,10 @@ class YuanModel(nn.Module):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.embed_tokens(input_ids)
+                hidden_states = self.embed_input_ids(input_ids)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states = layer(
@@ -837,11 +767,6 @@ class YuanModel(nn.Module):
         loaded_params: set[str] = set()
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
-
-        # Skip loading extra parameters for GPTQ/modelopt models.
-        ignore_suffixes = (".bias", "_bias", ".k_scale", "_k_scale",
-                           ".v_scale", "_v_scale", ".weight_scale",
-                           "_weight_scale", ".input_scale", "_input_scale")
 
         for name, loaded_weight in weights:
             if "rotary_pos_emb" in name:
@@ -1032,11 +957,10 @@ class YuanForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.cache_config = vllm_config.cache_config
-        if vllm_config.model_config.enforce_eager:
-            self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        else:
-            self.max_num_seqs = vllm_config.scheduler_config.cuda_graph_sizes[0]
-        self.full_cuda_graph = vllm_config.compilation_config.full_cuda_graph
+        self.full_cuda_graph = \
+            vllm_config.compilation_config.cudagraph_mode in [CUDAGraphMode.FULL]
+        print("self.full_cuda_graph: ", self.full_cuda_graph, flush=True)
+        self.backend = vllm_config.attention_config.backend
 
         inputs_len = vllm_config.scheduler_config.max_num_batched_tokens
         self.pre_lf_indexs = torch.zeros(inputs_len, dtype=torch.long, device="cuda")
@@ -1065,55 +989,43 @@ class YuanForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         if isinstance(attn_metadata, dict):
             attn_metadata = list(attn_metadata.values())[0]
 
-        if envs.VLLM_ATTENTION_BACKEND == "FLASHINFER" \
+        if self.backend == AttentionBackendEnum.FLASHINFER \
                 and isinstance(attn_metadata, FlashInferMetadata):
             # v1: use backend flashinfer
-            seq_lens = attn_metadata.seq_lens
             block_table = attn_metadata.block_table_tensor
-            num_reqs = seq_lens.shape[0]
+            seq_lens = attn_metadata.seq_lens
+            padding_reqs = (seq_lens == 0).sum().item()
+            num_reqs = seq_lens.shape[0] - padding_reqs
             input_len = input_ids.shape[0]
-            max_query_len = attn_metadata.max_q_len_prefill,
-            num_decodes = attn_metadata.num_decodes
-            num_decode_tokens = attn_metadata.num_decode_tokens
-            num_prefills = attn_metadata.num_prefills
-            num_prefill_tokens = attn_metadata.num_prefill_tokens
-            num_actual_tokens = num_decode_tokens + num_prefill_tokens
-            prefill_wrapper = attn_metadata.prefill_wrapper
-            decode_wrapper = attn_metadata.decode_wrapper
-            if decode_wrapper is not None and prefill_wrapper is None:
-                decode_wrapper = decode_wrapper._qo_indptr_buf
-                query_lens = decode_wrapper[1:] - decode_wrapper[:-1]
-                query_lens = query_lens[:num_decodes]
-            elif decode_wrapper is None and prefill_wrapper is not None:
-                prefill_wrapper = prefill_wrapper._qo_indptr_buf
-                query_lens = prefill_wrapper[1:] - prefill_wrapper[:-1]
-            elif decode_wrapper is not None and prefill_wrapper is not None:
-                decode_wrapper = decode_wrapper._qo_indptr_buf
-                prefill_wrapper = prefill_wrapper._qo_indptr_buf
-                query_lens_prefill = prefill_wrapper[1:] - prefill_wrapper[:-1]
-                query_lens_decode = decode_wrapper[1:] - decode_wrapper[:-1]
-                query_lens_decode = query_lens_decode[:num_decodes]
-                query_lens = torch.cat([query_lens_decode, query_lens_prefill]) 
-        elif isinstance(attn_metadata, FlashAttentionMetadata):
+            max_query_len = attn_metadata.max_q_len,
+            num_actual_tokens = attn_metadata.num_actual_tokens - padding_reqs
+            query_lens = attn_metadata.qo_indptr_gpu[1:] - attn_metadata.qo_indptr_gpu[:-1]
+        elif isinstance(attn_metadata, FlashAttentionMetadata) \
+                or isinstance(attn_metadata, TritonAttentionMetadata):
             # v1: use backend flashattn
             seq_lens = attn_metadata.seq_lens
-            block_table = attn_metadata.block_table
-            num_reqs = seq_lens.shape[0]
+            padding_reqs = (seq_lens == 0).sum().item()
+            num_reqs = seq_lens.shape[0] - padding_reqs
+            seq_lens = seq_lens[:num_reqs]
+            block_table = attn_metadata.block_table[:num_reqs]
             input_len = input_ids.shape[0]
             max_query_len = attn_metadata.max_query_len
             num_actual_tokens = attn_metadata.num_actual_tokens
-            query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1] 
+            query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
         else:
             assert False, f"Now not support {type(attn_metadata)}!"
 
+        seq_lens = seq_lens[:num_reqs]
+        block_table = block_table[:num_reqs]
+        query_lens = query_lens[:num_reqs]
         indices_1 = torch.clamp_min((seq_lens - 2) // self.cache_config.block_size, 0)
         pre_indices = torch.gather(block_table, dim=1, index=indices_1.long().unsqueeze(1)).squeeze()
         pre_indices = pre_indices.view(pre_indices.numel())
         indices_2 = (seq_lens - 1) // self.cache_config.block_size
-        lf_indices = torch.gather(block_table, dim=1, index=indices_2.long().unsqueeze(1)).squeeze()
+        lf_indices = torch.gather(block_table , dim=1, index=indices_2.long().unsqueeze(1)).squeeze()
         lf_indices = lf_indices.view(lf_indices.numel())
         # in cudagraph mode, prefill inputs_ids will padding with 0
-        if max_query_len == 1 and not self.full_cuda_graph:
+        if max_query_len == 1:
             # decode
             padding = input_len - num_reqs
             input_lf_loc_list = [x for x in range(0, 2*num_reqs, 2)]
@@ -1220,6 +1132,9 @@ class YuanForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
                 self.pre_lf_indexs[:pre_indices.shape[0]].copy_(pre_indices)
                 self.out_lf_indexs[:lf_indices.shape[0]].copy_(lf_indices)
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1267,7 +1182,7 @@ class YuanForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         self.num_local_physical_experts = num_local_physical_experts
         self.num_redundant_experts = (num_physical_experts -
                                       self.num_logical_experts)
-        for layer_idx, layer in enumerate(self.model.layers):
+        for _, layer in enumerate(self.model.layers):
             if isinstance(layer.mlp, YuanMoeLayer):
                 moe = layer.mlp
                 moe.n_local_physical_experts = num_local_physical_experts
@@ -1292,7 +1207,6 @@ class YuanForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
                         device=device),
         })
 
-    def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)

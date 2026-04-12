@@ -2,16 +2,18 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
 
-from typing import (Any, Callable, Iterable, List, Literal, Mapping, Optional,
-                    Set, Tuple, Type, TypedDict, Union, TypeVar)
+from typing import (Iterable, Literal, Mapping, Optional,
+                    Annotated, Tuple, TypedDict, Union, TypeVar)
 from PIL import Image
 
 import torch
 import torch.nn as nn
-from transformers import BatchFeature, BatchEncoding, PretrainedConfig, TensorType
+from transformers import BatchFeature, PretrainedConfig, TensorType
 
-from vllm.config import CacheConfig, MultiModalConfig, VllmConfig
+from vllm.config import VllmConfig
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.multimodal.inputs import (MultiModalDataDict, NestedTensors,
                                     MultiModalFieldConfig, MultiModalKwargsItems)
 from vllm.multimodal.parse import (ImageEmbeddingItems, ImageProcessorItems,
@@ -19,36 +21,27 @@ from vllm.multimodal.parse import (ImageEmbeddingItems, ImageProcessorItems,
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         BaseProcessingInfo, PromptReplacement,
                                         PromptUpdate, PromptUpdateDetails)
-from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
-from vllm.transformers_utils.tokenizer import AnyTokenizer
-from vllm import _custom_ops as ops
-from vllm.config import LoRAConfig, CacheConfig
+from vllm.multimodal.processing import BaseDummyInputsBuilder
+from vllm.tokenizers.protocol import TokenizerLike
 from transformers.activations import ACT2FN
-from vllm.model_executor.layers.linear import (
-    LinearMethodBase,
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear
-)
-# from vllm.model_executor.layers.sampler import SamplerOutput
-# from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.sequence import IntermediateTensors
 from vllm.logger import init_logger
 
-from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.models.intern_vit import (
-    InternVisionModel,
-    InternVisionPatchModel
-)
+from vllm.model_executor.models.intern_vit import (InternVisionModel,
+                                                   InternVisionPatchModel)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.model_executor.models.yuan import YuanForCausalLM
 from transformers import CLIPImageProcessor
-from .utils import (AutoWeightsLoader, PPMissingLayer,
-                    flatten_bn, merge_multimodal_embeddings)
-from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
+from vllm.utils.platform_utils import (
+    is_pin_memory_available,
+)
+from vllm.utils.tensor_schema import TensorSchema, TensorShape
+
+
+from .utils import AutoWeightsLoader, init_vllm_registered_model, maybe_prefix
+from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP, MixtureOfExperts
 
 
 BOS = '<BOS>'
@@ -63,27 +56,30 @@ MAX_IMAGE_FEATURE_SIZE_HEIGHT = 500
 logger = init_logger(__name__)
 
 
-class YuanVLImagePixelInputs(TypedDict):
+class YuanVLImagePixelInputs(TensorSchema):
+    """
+    Dimensions:
+        - bn: Batch size * number of images
+        - bnp: Batch size * number of images * (1 + num_patches)
+        - c: Number of channels (3)
+        - h: Height of each image patch
+        - w: Width of each image patch
+    """
+
     type: Literal["pixel_values"]
-    pixel_values_flat: torch.Tensor
+    pixel_values_flat: Annotated[torch.Tensor, TensorShape("bnp", 3, "h", "w")]
+    num_patches: Annotated[torch.Tensor, TensorShape("bn")]
+
+
+class YuanVLImageEmbeddingInputs(TensorSchema):
     """
-    Shape:
-    (batch_size * num_images * (1 + num_patches), num_channels, height, width)
+    Dimensions:
+        - n: Number of images
+        - f: Total image feature size
+        - h: Hidden size (must match the hidden size of language model backbone)
     """
-
-    num_patches: torch.Tensor
-    """Shape: `(batch_size * num_images)`"""
-
-
-class YuanVLImageEmbeddingInputs(TypedDict):
     type: Literal["image_embeds"]
-    data: Union[torch.Tensor, list[torch.Tensor]]
-    """
-    A tensor of shape `(num_images, total_image_feature_size, hidden_size)`
-    or a list of tensors of shape `(total_image_feature_size, hidden_size)`
-
-    `hidden_size` must match the hidden size of language model backbone.
-    """
+    data: Annotated[torch.Tensor | list[torch.Tensor], TensorShape("n", "f", "h")]
 
 
 YuanVLImageInputs = Union[YuanVLImagePixelInputs,
@@ -308,7 +304,7 @@ class BaseYuanVLProcessor(ABC):
     def __init__(
         self,
         config: PretrainedConfig,
-        tokenizer: AnyTokenizer,
+        tokenizer: TokenizerLike,
         *,
         min_dynamic_patch: Optional[int] = None,
         max_dynamic_patch: Optional[int] = None,
@@ -597,16 +593,21 @@ class YuanVLDummyInputsBuilder(BaseDummyInputsBuilder[_I]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
         target_width, target_height = \
             self.info.get_image_size_with_most_features()
         num_images = mm_counts.get("image", 0)
+        image_overrides = mm_options.get("image")
 
         return {
             "image":
-            self._get_dummy_images(width=target_width,
-                                   height=target_height,
-                                   num_images=num_images)
+            self._get_dummy_images(
+                width=target_width,
+                height=target_height,
+                num_images=num_images,
+                overrides=image_overrides,
+            )
         }
 
 
@@ -765,7 +766,7 @@ class YuanImageMLP(nn.Module):
     YuanVLMultiModalProcessor,
     info=YuanVLProcessingInfo,
     dummy_inputs=YuanVLDummyInputsBuilder)
-class YuanVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
+class YuanVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, MixtureOfExperts):
     def __init__(
         self,
         *,
@@ -776,6 +777,8 @@ class YuanVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
+        # self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
+        # self._patch_quant_config(config, quant_config)
 
         self.config = config
         self.text_config = vllm_config.model_config.hf_text_config
@@ -786,25 +789,26 @@ class YuanVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
         self.downsample_ratio = config.downsample_ratio
         self.imagemlp_input_hiddensize = int(config.vision_config.hidden_size / self.downsample_ratio ** 2)
 
-        self.select_layer = config.select_layer
-        vision_feature_layer = self.select_layer
-        if vision_feature_layer < 0:
-            num_hidden_layers = config.vision_config.num_hidden_layers \
-                + vision_feature_layer + 1
-        else:
-            num_hidden_layers = vision_feature_layer + 1
+        self.is_mono = False
+        with self._mark_tower_model(vllm_config, {"image", "video"}):
+            self.vision_model = self._init_vision_model(
+                config,
+                quant_config=quant_config,
+                is_mono=self.is_mono,
+                prefix=maybe_prefix(prefix, ""),
+                # prefix=maybe_prefix(prefix, "vision_model"),
+            )
 
-        # 创建语言模型部分
-        self.language_model = YuanForCausalLM(vllm_config=vllm_config, prefix="language_model")
+        with self._mark_language_model(vllm_config):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=config.text_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+            )
 
-        self.vision_model = InternVisionModel(config.vision_config,
-                                              quant_config=quant_config,
-                                              num_hidden_layers_override=num_hidden_layers,
-                                              prefix='')
         self.make_empty_intermediate_tensors = (self.language_model.make_empty_intermediate_tensors)
 
         self.pixel_unshuffle = torch.nn.PixelUnshuffle(downscale_factor=2)
-        # 此处需要修改
         self.imagemlp_ffn_hidden_size = config.text_config.ffn_hidden_size
         self.imagemlp = YuanImageMLP(self.imagemlp_input_hiddensize,
                                      self.imagemlp_ffn_hidden_size,
@@ -814,6 +818,54 @@ class YuanVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
             config.text_config.hidden_size,
             eps=config.text_config.rms_norm_eps
         )
+        self.num_moe_layers = self.language_model.num_moe_layers
+        self.num_expert_groups = self.language_model.num_expert_groups
+        self.num_shared_experts = self.language_model.num_shared_experts
+        self.num_logical_experts = self.language_model.num_logical_experts
+        self.num_physical_experts = self.language_model.num_physical_experts
+        self.num_local_physical_experts = self.language_model.num_local_physical_experts
+        self.num_routed_experts = self.language_model.num_routed_experts
+        self.num_redundant_experts = self.language_model.num_redundant_experts
+        self.num_routed_experts_list = self.language_model.num_routed_experts_list
+
+    def _patch_quant_config(
+        self, config: PretrainedConfig, quant_config: QuantizationConfig
+    ):
+        # the awq models from OpenGVLab missing `modules_to_not_convert`
+        # patch the quant_config to add `modules_to_not_convert` back
+        if isinstance(quant_config, AWQConfig):
+            text_config = config.text_config
+            llm_quant_config = getattr(text_config, "quantization_config", None)
+            if (not quant_config.modules_to_not_convert) and (
+                llm_quant_config is not None
+            ):
+                quant_config.modules_to_not_convert.append("vision_model")
+
+    def _init_vision_model(
+        self,
+        config: PretrainedConfig,
+        quant_config: QuantizationConfig | None,
+        *,
+        is_mono: bool,
+        prefix: str,
+    ):
+        if not is_mono:
+            vision_feature_layer = config.select_layer
+            if vision_feature_layer < 0:
+                num_hidden_layers = (
+                    config.vision_config.num_hidden_layers + vision_feature_layer + 1
+                )
+            else:
+                num_hidden_layers = vision_feature_layer + 1
+
+            return InternVisionModel(
+                config.vision_config,
+                quant_config=quant_config,
+                num_hidden_layers_override=num_hidden_layers,
+                prefix=prefix,
+            )
+        else:
+            return InternVisionPatchModel(config.vision_config)
 
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
@@ -889,26 +941,25 @@ class YuanVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
 
             return YuanVLImageEmbeddingInputs(
                 type="image_embeds",
-                data=flatten_bn(image_embeds),
+                data=image_embeds,
             )
 
         image_token_id = kwargs["image_token_id"]
-        assert isinstance(image_token_id, torch.Tensor)
-        self.img_context_token_id = image_token_id.flatten().unique().item()
+        if isinstance(image_token_id, torch.Tensor):
+            image_token_id = image_token_id.flatten().unique().item()
+
+        assert isinstance(image_token_id, int)
+        self.img_context_token_id = image_token_id
 
         if pixel_values_flat is not None:
-            if not isinstance(pixel_values_flat, (torch.Tensor, list)):
-                raise ValueError("Incorrect type of pixel values. "
-                                 f"Got type: {type(pixel_values_flat)}")
-
-            pixel_values_flat = flatten_bn(pixel_values_flat, concat=True)
-            image_num_patches = flatten_bn(image_num_patches, concat=True)
+            expected_h = expected_w = self.config.vision_config.image_size
+            resolve_bindings = {"h": expected_h, "w": expected_w}
 
             return YuanVLImagePixelInputs(
                 type="pixel_values",
-                pixel_values_flat=self._validate_pixel_values(
-                    pixel_values_flat),
+                pixel_values_flat=self._validate_pixel_values(pixel_values_flat),
                 num_patches=image_num_patches,
+                resolve_bindings=resolve_bindings,
             )
 
         raise AssertionError("This line should be unreachable.")
@@ -944,7 +995,16 @@ class YuanVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
 
         return image_embeds
 
-    def get_multimodal_embeddings(
+    def _set_visual_token_mask(self, input_ids: torch.Tensor) -> None:
+        if self.is_mono:
+            assert self.img_context_token_id is not None
+            self.visual_token_mask = (input_ids == self.img_context_token_id).reshape(
+                -1, 1
+            )
+        else:
+            self.visual_token_mask = None
+
+    def embed_multimodal(
             self, **kwargs) -> Optional[MultiModalEmbeddings]:
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
@@ -954,26 +1014,45 @@ class YuanVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
         vision_embeddings = self._process_image_input(image_input)
         return vision_embeddings
 
-    def get_input_embeddings(
+    def embed_input_ids(
         self,
         input_ids: torch.Tensor,
-        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
-        inputs_embeds = self.language_model.model.get_input_embeddings(input_ids)
-        # 将image embed 放到img_context_token_id的位置
-        if multimodal_embeddings is not None:
-            assert self.img_context_token_id is not None
-            # input_ids: torch.Tensor,
-            # inputs_embeds: torch.Tensor,
-            # multimodal_embeddings: MultiModalEmbeddings,
-            # placeholder_token_id: img_context_token_id,
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids,
-                inputs_embeds,
-                multimodal_embeddings,
-                self.img_context_token_id,
-            )
-        return inputs_embeds
+        if multimodal_embeddings is not None and len(multimodal_embeddings) > 0:
+            self._set_visual_token_mask(input_ids)
+
+        # This is to satisfy the type checker for each overload
+        if multimodal_embeddings is None or is_multimodal is None:
+            return super().embed_input_ids(input_ids)
+
+        return super().embed_input_ids(
+            input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+            handle_oov_mm_token=handle_oov_mm_token,
+        )
+
+    def set_eplb_state(
+        self,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+    ):
+        self.language_model.set_eplb_state(
+            expert_load_view, logical_to_physical_map, logical_replica_count
+        )
+        self.expert_weights = self.language_model.expert_weights
+
+    def update_physical_experts_metadata(
+        self, num_physical_experts: int, num_local_physical_experts: int
+    ):
+        self.language_model.update_physical_experts_metadata(
+            num_physical_experts, num_local_physical_experts
+        )
 
     def forward(
         self,
@@ -984,16 +1063,8 @@ class YuanVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
         **kwargs: object,
     ) -> IntermediateTensors:
         if intermediate_tensors is not None:
-            input_ids = None
             inputs_embeds = None
-        # NOTE: In v1, inputs_embeds is always generated at model runner, this
-        # condition is for v0 compatibility.
-        elif inputs_embeds is None:
-            # (images, patches * token_per_image)
-            vision_embeddings = self.get_multimodal_embeddings(**kwargs)
-            # (tokens, hidden_size)
-            inputs_embeds = self.get_input_embeddings(input_ids, vision_embeddings)
-            input_ids = None
+
         forward_kwargs = {
             "input_ids": input_ids,
             "positions": positions,
@@ -1013,7 +1084,6 @@ class YuanVLChatModel(nn.Module, SupportsMultiModal, SupportsPP):
         )
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str,torch.Tensor]]):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)

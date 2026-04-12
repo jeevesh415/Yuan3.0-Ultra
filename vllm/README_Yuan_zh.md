@@ -1,8 +1,8 @@
 ##  1.镜像方式（建议）
 
-建议使用 Yuan3.0 Ultra 的最新版本 docker 镜像。
+我们强烈建议使用 Yuan3.0 Flash 的最新版本 docker 镜像。可以通过以下命令获取镜像：
 ```bash
-docker pull yuanlabai/vllm:v0.11.0
+docker pull yuanlabai/vllm:v0.17.0
 ```
 
 ##  2.源码编译（可选）
@@ -20,16 +20,20 @@ pip install -e .
 
 可使用以下 Docker 命令启动 Yuan3.0 Ultra 容器实例：
 ```bash
-docker run --gpus all -itd --network=host --privileged --cap-add=IPC_LOCK --ulimit stack=68719476736 --shm-size=1000G -v /path/to/dataset:/workspace/dataset -v /path/to/checkpoints:/workspace/checkpoints --name your_name yuanlabai/vllm:v0.11.0
+docker run --gpus all -itd --network=host --privileged --cap-add=IPC_LOCK --ulimit stack=68719476736 --shm-size=1000G -v /path/to/dataset:/workspace/dataset -v /path/to/checkpoints:/workspace/checkpoints --name your_name yuanlabai/vllm:v0.17.0
 docker exec -it your_name bash
 ```
 
 **3.2  部署服务**
 
-Yuan3.0 Ultra Model 仅支持 vLLm V1架构。多节点ray服务启动命令请参考[多节点服务](./examples/online_serving/multi-node-serving.sh)教程。
+Yuan3.0 Ultra Model 仅支持 vLLm V1架构。<br>
+多节点ray服务启动命令请参考[多节点服务](./examples/online_serving/multi-node-serving.sh)教程。<br>
+使用 Ray 作为后端的多节点部署存在些[问题](https://github.com/vllm-project/vllm/issues/35848)。<br>
+请需要使用ray_V2作为backend，设置'export VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1' <br>
 ```bash
 python -m vllm.entrypoints.openai.api_server --model=/path/Yuan3.0-Ultra-int4 --port 8100 --gpu-memory-utilization 0.9 \
- --tensor-parallel-size 4 --pipeline-parallel-size 4 --trust-remote-code --allowed-local-media-path "/path/images"
+ --tensor-parallel-size 4 --pipeline-parallel-size 4 --distributed-executor-backend ray \
+ --trust-remote-code --allowed-local-media-path "/path/images"
 ```
 > **Note 1**:如果您有复杂的网络配置，可能需要配置[网络设置](./docs/usage/troubleshooting.md#L76)。   
 > **Note 2**:对于int4模型，并行方式建议设置4路张量并行和4路流水线并行。    
